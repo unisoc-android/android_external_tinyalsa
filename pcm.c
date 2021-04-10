@@ -1182,6 +1182,8 @@ int pcm_set_avail_min(struct pcm *pcm, int avail_min)
         return -ENOSYS;
 
     pcm->config.avail_min = avail_min;
+    if (pcm->mmap_control)
+        pcm->mmap_control->avail_min = avail_min;
     return 0;
 }
 
@@ -1236,18 +1238,26 @@ int pcm_mmap_transfer(struct pcm *pcm, const void *buffer, unsigned int bytes)
     int err = 0, frames, avail;
     unsigned int offset = 0, count;
 
+    unsigned int max_timeout = 0;
+    unsigned int total_timeout = 0;
+    unsigned int write_frames = 0;
+
     if (bytes == 0)
         return 0;
 
+    if(!pcm)
+	return -ENODEV;
+
     count = pcm_bytes_to_frames(pcm, bytes);
+    write_frames = count;
 
     while (count > 0) {
 
         /* get the available space for writing new frames */
         avail = pcm_avail_update(pcm);
-        if (avail < 0) {
+        if ((unsigned int)avail > pcm->buffer_size) {
             fprintf(stderr, "cannot determine available mmap frames");
-            return err;
+            return -1;
         }
 
         /* start the audio if we reach the threshold */
@@ -1276,9 +1286,14 @@ int pcm_mmap_transfer(struct pcm *pcm, const void *buffer, unsigned int bytes)
                 /* disable waiting for avail_min threshold to allow small amounts of data to be
                  * written without waiting as long as there is enough room in buffer. */
                 pcm->wait_for_avail_min = 0;
-
-                if (pcm->flags & PCM_NOIRQ)
+                if (pcm->flags & PCM_NOIRQ){
                     time = (pcm->config.avail_min - avail) / pcm->noirq_frames_per_msec;
+                    if(!max_timeout) {
+                        max_timeout = ((pcm->buffer_size + write_frames)/pcm->noirq_frames_per_msec)*5;
+                        if(max_timeout < 3000)
+                            max_timeout = 3000;
+                    }
+                }
 
                 err = pcm_wait(pcm, time);
                 if (err < 0) {
@@ -1290,6 +1305,18 @@ int pcm_mmap_transfer(struct pcm *pcm, const void *buffer, unsigned int bytes)
                         avail);
                     pcm->mmap_control->appl_ptr = 0;
                     return err;
+                }
+
+                if(max_timeout && (0 == err)) {
+                    total_timeout += time;
+                    if(total_timeout >= max_timeout) {
+                        oops(pcm, errno, "wait timeout error : hw 0x%x app 0x%x avail 0x%x\n",
+                            (unsigned int)pcm->mmap_status->hw_ptr,
+                            (unsigned int)pcm->mmap_control->appl_ptr,
+                            total_timeout);
+                        pcm->mmap_control->appl_ptr = 0;
+                        return -EPIPE;
+                    }
                 }
                 continue;
             }
